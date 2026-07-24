@@ -1,0 +1,80 @@
+{
+  "trace_id": "tr-abc123def456",
+  "state": "ERROR",
+  "duration_ms": 1250.0,
+  "request_time_ms": 1721822400000,
+  "request_preview": "{\"question\": \"What is the refund policy?\"}",
+  "response_preview": "",
+  "tags": {
+    "mlflow.traceName": "rag_predict",
+    "environment": "prod"
+  },
+  "metadata": {
+    "mlflow.trace.run_id": "run-0099",
+    "mlflow.source.name": "app/rag.py"
+  },
+  "spans": [
+    {
+      "span_id": "s-root",
+      "parent_id": null,
+      "name": "predict",
+      "start_ns": 0,
+      "end_ns": 1250000000,
+      "status": "ERROR",
+      "status_message": "downstream span 'llm_generate' failed",
+      "inputs": {"question": "What is the refund policy?"},
+      "outputs": null,
+      "attributes": {"mlflow.spanType": "CHAIN"},
+      "events": []
+    },
+    {
+      "span_id": "s-retrieve",
+      "parent_id": "s-root",
+      "name": "retrieve_docs",
+      "start_ns": 10000000,
+      "end_ns": 60000000,
+      "status": "OK",
+      "status_message": "",
+      "inputs": {"query": "refund policy", "k": 4},
+      "outputs": {"num_docs": 4},
+      "attributes": {"mlflow.spanType": "RETRIEVER"},
+      "events": []
+    },
+    {
+      "span_id": "s-rerank",
+      "parent_id": "s-root",
+      "name": "rerank",
+      "start_ns": 60000000,
+      "end_ns": 900000000,
+      "status": "OK",
+      "status_message": "",
+      "inputs": {"num_candidates": 4},
+      "outputs": {"num_reranked": 4},
+      "attributes": {"mlflow.spanType": "RERANKER"},
+      "events": []
+    },
+    {
+      "span_id": "s-llm",
+      "parent_id": "s-root",
+      "name": "llm_generate",
+      "start_ns": 900000000,
+      "end_ns": 1240000000,
+      "status": "ERROR",
+      "status_message": "RateLimitError",
+      "inputs": {"model": "gpt-4", "prompt_tokens": 31200, "messages": [{"role": "user", "content": "What is the refund policy? Context: ..."}]},
+      "outputs": null,
+      "attributes": {"mlflow.spanType": "LLM"},
+      "events": [
+        {
+          "name": "exception",
+          "timestamp_ns": 1240000000,
+          "attributes": {
+            "exception.type": "RateLimitError",
+            "exception.message": "Rate limit exceeded for model gpt-4: 30000 tokens per minute (requested 31200)",
+            "exception.stacktrace": "Traceback (most recent call last):\n  File \"app/rag.py\", line 88, in llm_generate\n    response = client.chat.completions.create(model=model, messages=messages)\n  File \"openai/_base_client.py\", line 1041, in create\n    raise self._make_status_error(err)\nopenai.RateLimitError: Rate limit exceeded for model gpt-4: 30000 tokens per minute (requested 31200)"
+          }
+        }
+      ]
+    }
+  ]
+}
