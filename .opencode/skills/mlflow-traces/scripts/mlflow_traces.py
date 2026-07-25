@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mlflow-skinny>=3.13"]
+# dependencies = ["mlflow-skinny>=3.13", "boto3>=1.34"]
 # ///
 """Operate on MLflow traces from the CLI.
 
@@ -11,8 +11,12 @@ structured diagnose report for root-causing.
 
 Backend is whatever the environment already points at: MLFLOW_TRACKING_URI
 (self-hosted server or `databricks[://profile]`) plus the usual Databricks
-auth (DATABRICKS_HOST/DATABRICKS_TOKEN or ~/.databrickscfg). Nothing is
-hardcoded. `mlflow` is imported lazily, so --from-file works with no backend.
+auth (DATABRICKS_HOST/DATABRICKS_TOKEN or ~/.databrickscfg). If
+MLFLOW_TRACKING_ARN is a Secrets Manager ARN, it's resolved via boto3 (using
+whatever AWS credentials are already in the environment) into
+MLFLOW_TRACKING_URI/_USERNAME/_PASSWORD. Nothing is hardcoded. `mlflow` is
+imported lazily, so --from-file works with no backend — and it reads both
+MLflow's own `Trace.to_json()` export and this script's --json output.
 
 Run with uv (zero-install):  uv run mlflow_traces.py <cmd> ...
 Or, if mlflow is installed:   python mlflow_traces.py <cmd> ...
@@ -25,6 +29,7 @@ import os
 import re
 import sys
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -34,9 +39,24 @@ from typing import Any, Dict, List, Optional, Tuple
 #
 # Live MLflow Trace objects and JSON-loaded dicts are both converted into
 # these plain structures so every downstream helper is trivially testable and
-# version-independent. The JSON shape emitted by --json round-trips back in
-# through --from-file.
+# version-independent. Three input shapes are supported (see normalize_span):
+# a live MLflow 3.x entity, MLflow's own ``Trace.to_json()`` export (OTel
+# field names), and the flat shape this script emits with --json — all three
+# read back in through --from-file.
 # --------------------------------------------------------------------------
+
+# Attribute/metadata keys MLflow actually writes (mlflow.tracing.constant,
+# verified against mlflow 3.14). Span I/O lives in attributes on the JSON
+# export, which is why they are pulled out here rather than assumed present
+# as top-level fields.
+_ATTR_INPUTS = "mlflow.spanInputs"
+_ATTR_OUTPUTS = "mlflow.spanOutputs"
+_ATTR_SPAN_TYPE = "mlflow.spanType"
+_ATTR_TOKENS = "mlflow.chat.tokenUsage"
+_ATTR_COST = "mlflow.llm.cost"
+_ATTR_MODEL = "mlflow.llm.model"
+_META_TOKENS = "mlflow.trace.tokenUsage"
+_META_COST = "mlflow.trace.cost"
 
 
 @dataclass
@@ -59,6 +79,10 @@ class NSpan:
     outputs: Any
     attributes: Dict[str, Any]
     events: List[NEvent] = field(default_factory=list)
+    span_type: str = ""
+    model: str = ""
+    tokens: Dict[str, Any] = field(default_factory=dict)
+    cost_usd: Optional[float] = None
 
     @property
     def total_ms(self) -> Optional[float]:
@@ -78,6 +102,8 @@ class NTrace:
     tags: Dict[str, Any]
     metadata: Dict[str, Any]
     spans: List[NSpan]
+    tokens: Dict[str, Any] = field(default_factory=dict)
+    cost_usd: Optional[float] = None
 
 
 # --------------------------------------------------------------------------
@@ -111,9 +137,15 @@ def _short_status(raw: Any) -> str:
         return "UNKNOWN"
     val = getattr(raw, "value", raw)
     s = str(val)
-    if "." in s:
+    if "." in s:  # str(SpanStatusCode.ERROR) == "SpanStatusCode.ERROR"
         s = s.rsplit(".", 1)[-1]
-    return s.upper() or "UNKNOWN"
+    s = s.upper()
+    # MLflow's JSON export uses the OTel proto spelling.
+    for prefix in ("STATUS_CODE_", "TRACE_STATE_", "STATE_"):
+        if s.startswith(prefix):
+            s = s[len(prefix) :]
+            break
+    return s or "UNKNOWN"
 
 
 def _as_obj(value: Any) -> Any:
@@ -148,39 +180,90 @@ def _to_dict(value: Any) -> Dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+def _decode_attributes(raw: Any) -> Dict[str, Any]:
+    """Attributes as a plain dict, with JSON-encoded values decoded.
+
+    A live span hands back decoded values; MLflow's JSON export stores every
+    attribute value as a JSON string (``"mlflow.spanType": "\\"LLM\\""``).
+    Decoding here makes both shapes identical for everything downstream.
+    """
+    return {key: _as_obj(val) for key, val in _to_dict(raw).items()}
+
+
+def _first_float(*values: Any) -> Optional[float]:
+    """First value coercible to float; dicts contribute their ``total_*`` key.
+
+    MLflow reports cost as ``{"input_cost": .., "output_cost": .., "total_cost": ..}``.
+    """
+    for val in values:
+        if isinstance(val, dict):
+            val = val.get("total_cost", val.get("total"))
+        if val is None or isinstance(val, bool):
+            continue
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def normalize_event(raw: Any) -> NEvent:
     return NEvent(
         name=str(_get(raw, "name", default="")),
-        timestamp_ns=_get(raw, "timestamp_ns", "timestamp"),
+        timestamp_ns=_get(raw, "timestamp_ns", "timestamp", "time_unix_nano"),
         attributes=_to_dict(_get(raw, "attributes", default={})),
     )
 
 
 def normalize_span(raw: Any) -> NSpan:
-    # Live span: ``status`` is a SpanStatus(status_code=<SpanStatusCode>, description=...).
-    # Our --json: ``status`` is a plain string and ``status_message`` is a sibling.
+    # ``status`` arrives in three shapes:
+    #   live span   -> SpanStatus(status_code=<SpanStatusCode>, description=...)
+    #   MLflow JSON -> {"code": "STATUS_CODE_ERROR", "message": ...}
+    #   our --json  -> a plain string, with ``status_message`` as a sibling
     status = _get(raw, "status")
     if status is None or isinstance(status, str):
         status_code = status
         status_message = _get(raw, "status_message", default="")
     else:
-        status_code = _get(status, "status_code")
-        status_message = _get(status, "description") or _get(raw, "status_message", default="")
+        status_code = _get(status, "status_code", "code")
+        status_message = _get(status, "description", "message") or _get(
+            raw, "status_message", default=""
+        )
 
     events = [normalize_event(e) for e in (_get(raw, "events", default=[]) or [])]
+    attributes = _decode_attributes(_get(raw, "attributes", default={}))
+
+    # Live spans expose inputs/outputs as properties; the JSON export only has
+    # them under the corresponding mlflow.* attributes.
+    inputs = _as_obj(_get(raw, "inputs"))
+    if inputs is None:
+        inputs = attributes.get(_ATTR_INPUTS)
+    outputs = _as_obj(_get(raw, "outputs"))
+    if outputs is None:
+        outputs = attributes.get(_ATTR_OUTPUTS)
+
+    tokens = _get(raw, "tokens") or attributes.get(_ATTR_TOKENS)
 
     return NSpan(
         span_id=str(_get(raw, "span_id", default="")),
-        parent_id=_get(raw, "parent_id"),
+        parent_id=_get(raw, "parent_id", "parent_span_id"),
         name=str(_get(raw, "name", default="<unnamed>")),
-        start_ns=_get(raw, "start_time_ns", "start_ns"),
-        end_ns=_get(raw, "end_time_ns", "end_ns"),
+        start_ns=_get(raw, "start_time_ns", "start_ns", "start_time_unix_nano"),
+        end_ns=_get(raw, "end_time_ns", "end_ns", "end_time_unix_nano"),
         status=_short_status(status_code),
         status_message=str(status_message or ""),
-        inputs=_as_obj(_get(raw, "inputs")),
-        outputs=_as_obj(_get(raw, "outputs")),
-        attributes=_to_dict(_get(raw, "attributes", default={})),
+        inputs=inputs,
+        outputs=outputs,
+        attributes=attributes,
         events=events,
+        span_type=str(_get(raw, "span_type", default="") or attributes.get(_ATTR_SPAN_TYPE) or ""),
+        model=str(
+            _get(raw, "model_name", "model", default="") or attributes.get(_ATTR_MODEL) or ""
+        ),
+        tokens=tokens if isinstance(tokens, dict) else {},
+        cost_usd=_first_float(
+            _get(raw, "llm_cost", "cost_usd"), attributes.get(_ATTR_COST)
+        ),
     )
 
 
@@ -194,8 +277,35 @@ def _extract_spans(trace: Any) -> List[Any]:
     return list(spans or [])
 
 
+def _epoch_ms(value: Any) -> Optional[int]:
+    """Coerce a timestamp to epoch milliseconds.
+
+    Live entities use int ms; MLflow's JSON export writes ISO-8601 instead
+    (``"2026-07-25T01:59:15.245Z"``).
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+        try:  # 3.10's fromisoformat can't read a trailing "Z"
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    return None
+
+
 def normalize_trace(trace: Any) -> NTrace:
-    """Convert a live MLflow 3.x Trace or our flat --json/fixture dict.
+    """Convert a live MLflow 3.x Trace, an MLflow JSON export, or our flat dict.
 
     A live Trace / export dict keeps its metadata under ``info``; our flat dict
     carries the same fields at the top level.
@@ -203,19 +313,29 @@ def normalize_trace(trace: Any) -> NTrace:
     info = _get(trace, "info")
     src = info if info is not None else trace
 
-    duration = _get(src, "execution_duration", "duration_ms")
+    duration = _get(src, "execution_duration", "duration_ms", "execution_duration_ms")
     spans = [normalize_span(s) for s in _extract_spans(trace)]
+    metadata = _to_dict(_get(src, "trace_metadata", "metadata", default={}))
+
+    # Aggregate token usage / cost live in trace metadata as JSON strings; the
+    # live entity also exposes them as .token_usage / .cost.
+    tokens = (
+        _get(src, "token_usage") or _as_obj(metadata.get(_META_TOKENS)) or _get(trace, "tokens")
+    )
+    cost = _first_float(_get(src, "cost", "cost_usd"), _as_obj(metadata.get(_META_COST)))
 
     return NTrace(
         trace_id=str(_get(src, "trace_id", default="")),
         state=_short_status(_get(src, "state")),
-        duration_ms=float(duration) if duration is not None else None,
-        request_time_ms=_get(src, "request_time", "request_time_ms"),
+        duration_ms=_first_float(duration),
+        request_time_ms=_epoch_ms(_get(src, "request_time", "request_time_ms")),
         request_preview=str(_get(src, "request_preview", default="") or ""),
         response_preview=str(_get(src, "response_preview", default="") or ""),
         tags=_to_dict(_get(src, "tags", default={})),
-        metadata=_to_dict(_get(src, "trace_metadata", "metadata", default={})),
+        metadata=metadata,
         spans=spans,
+        tokens=tokens if isinstance(tokens, dict) else {},
+        cost_usd=cost,
     )
 
 
@@ -277,8 +397,59 @@ def error_spans(trace: NTrace) -> List[NSpan]:
     return [s for s in trace.spans if s.status == "ERROR" or span_exceptions(s)]
 
 
-def slowest_spans(trace: NTrace, top_n: int = 5) -> List[Tuple[NSpan, Optional[float]]]:
-    _, children = build_span_forest(trace.spans)
+def is_error_trace(trace: NTrace) -> bool:
+    """Did this trace fail? (state, or any span carrying an error/exception)"""
+    return trace.state == "ERROR" or bool(error_spans(trace))
+
+
+def span_depths(spans: List[NSpan]) -> Dict[str, int]:
+    """Depth of each span from its root, following parent links."""
+    by_id = {s.span_id: s for s in spans}
+    depths: Dict[str, int] = {}
+
+    def depth_of(span: NSpan) -> int:
+        cached = depths.get(span.span_id)
+        if cached is not None:
+            return cached
+        depths[span.span_id] = 0  # placeholder: also breaks parent-link cycles
+        parent = by_id.get(span.parent_id) if span.parent_id else None
+        value = depth_of(parent) + 1 if parent is not None else 0
+        depths[span.span_id] = value
+        return value
+
+    for s in spans:
+        depth_of(s)
+    return depths
+
+
+def originating_exceptions(trace: NTrace) -> List[Tuple[NSpan, Dict[str, str]]]:
+    """Exceptions paired with the deepest span that recorded them.
+
+    An exception propagating out of a nested span is re-recorded on every
+    ancestor, so a single failure otherwise shows up once per level. Keeping
+    only the deepest occurrence of each (type, message) points at the span the
+    failure actually came from.
+    """
+    depths = span_depths(trace.spans)
+    deepest: Dict[Tuple[str, str], Tuple[int, NSpan, Dict[str, str]]] = {}
+    for span in trace.spans:
+        for exc in span_exceptions(span):
+            key = (exc["type"], exc["message"])
+            depth = depths.get(span.span_id, 0)
+            current = deepest.get(key)
+            if current is None or depth > current[0]:
+                deepest[key] = (depth, span, exc)
+    return [(span, exc) for _, span, exc in deepest.values()]
+
+
+def slowest_spans(
+    trace: NTrace,
+    top_n: int = 5,
+    children: Optional[Dict[str, List[NSpan]]] = None,
+) -> List[Tuple[NSpan, Optional[float]]]:
+    """Spans ranked by self time. Pass ``children`` to reuse an existing forest."""
+    if children is None:
+        _, children = build_span_forest(trace.spans)
     ranked = [(s, span_self_ms(s, children)) for s in trace.spans]
     ranked.sort(key=lambda pair: (pair[1] is None, -(pair[1] or 0.0)))
     return ranked[:top_n]
@@ -306,11 +477,10 @@ def group_errors(traces: List[NTrace]) -> List[Dict[str, Any]]:
     groups: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for tr in traces:
         buckets = []
-        spans_with_exc = [s for s in tr.spans if span_exceptions(s)]
-        if spans_with_exc:
-            for span in spans_with_exc:
-                for exc in span_exceptions(span):
-                    buckets.append((exc["type"] or "<no-type>", span.name, exc["message"]))
+        origins = originating_exceptions(tr)
+        if origins:
+            for span, exc in origins:
+                buckets.append((exc["type"] or "<no-type>", span.name, exc["message"]))
         else:
             for span in error_spans(tr):
                 buckets.append(("<no-exception-event>", span.name, span.status_message))
@@ -355,6 +525,10 @@ def span_to_dict(span: NSpan) -> Dict[str, Any]:
         "status_message": span.status_message,
         "inputs": span.inputs,
         "outputs": span.outputs,
+        "span_type": span.span_type,
+        "model": span.model,
+        "tokens": span.tokens,
+        "cost_usd": span.cost_usd,
         "attributes": span.attributes,
         "events": [
             {"name": e.name, "timestamp_ns": e.timestamp_ns, "attributes": e.attributes}
@@ -371,6 +545,8 @@ def trace_to_dict(trace: NTrace) -> Dict[str, Any]:
         "request_time_ms": trace.request_time_ms,
         "request_preview": trace.request_preview,
         "response_preview": trace.response_preview,
+        "tokens": trace.tokens,
+        "cost_usd": trace.cost_usd,
         "tags": trace.tags,
         "metadata": trace.metadata,
         "spans": [span_to_dict(s) for s in trace.spans],
@@ -407,12 +583,45 @@ def _fmt_ms(ms: Optional[float]) -> str:
     return f"{ms:.1f}ms"
 
 
+def _fmt_tokens(tokens: Dict[str, Any]) -> str:
+    """``{"input_tokens": 10, "output_tokens": 5, ...}`` -> ``in 10 / out 5 / total 15``."""
+    parts = []
+    for key, label in (
+        ("input_tokens", "in"),
+        ("output_tokens", "out"),
+        ("total_tokens", "total"),
+        ("cache_read_input_tokens", "cache-read"),
+        ("cache_creation_input_tokens", "cache-write"),
+    ):
+        val = tokens.get(key)
+        if val:
+            parts.append(f"{label} {val}")
+    return " / ".join(parts)
+
+
+def _span_llm_note(span: NSpan) -> str:
+    """Compact ``[LLM gpt-4o  in 10 / out 5  $0.0012]`` suffix, empty when absent."""
+    bits = [b for b in (span.span_type or "", span.model) if b and b != "UNKNOWN"]
+    if span.tokens:
+        bits.append(_fmt_tokens(span.tokens))
+    if span.cost_usd is not None:
+        bits.append(f"${span.cost_usd:.4f}")
+    return f"  [{'  '.join(bits)}]" if bits else ""
+
+
 def render_span_tree(trace: NTrace, errors_only: bool = False, max_io: int = 500) -> str:
     roots, children = build_span_forest(trace.spans)
-    total = trace.duration_ms or max((s.total_ms or 0.0) for s in trace.spans) if trace.spans else 0.0
+    if trace.duration_ms:
+        total = trace.duration_ms
+    else:  # no trace-level duration: scale bars against the widest span
+        total = max((s.total_ms or 0.0) for s in trace.spans) if trace.spans else 0.0
     lines: List[str] = []
+    seen: set = set()
 
     def visit(span: NSpan, depth: int) -> None:
+        if span.span_id in seen:  # malformed parent links must not loop forever
+            return
+        seen.add(span.span_id)
         exc = span_exceptions(span)
         show = (not errors_only) or span.status == "ERROR" or exc
         if show:
@@ -425,11 +634,16 @@ def render_span_tree(trace: NTrace, errors_only: bool = False, max_io: int = 500
             lines.append(
                 f"{indent}{mark} {span.name}  "
                 f"{_fmt_ms(span.total_ms)} (self {_fmt_ms(self_ms)})  {bar}"
+                f"{_span_llm_note(span)}"
             )
-            if span.status == "ERROR" and span.status_message:
-                lines.append(f"{indent}    ! {span.status_message}")
-            for e in exc:
-                lines.append(f"{indent}    ! {e['type']}: {e['message']}")
+            # MLflow sets status_message to "Type: message", which the
+            # exception lines below already say — only print what adds detail.
+            exc_lines = [f"{e['type']}: {e['message']}" for e in exc]
+            msg = span.status_message
+            if span.status == "ERROR" and msg and not any(msg in line for line in exc_lines):
+                lines.append(f"{indent}    ! {msg}")
+            for line in exc_lines:
+                lines.append(f"{indent}    ! {line}")
             if errors_only and (span.status == "ERROR" or exc):
                 if span.inputs is not None:
                     lines.append(f"{indent}    inputs: {_stringify(span.inputs, max_io)}")
@@ -449,6 +663,10 @@ def render_trace_detail(trace: NTrace, errors_only: bool = False, max_io: int = 
     ]
     if trace.request_time_ms:
         out.append(f"  started  : {_fmt_epoch_ms(trace.request_time_ms)}")
+    if trace.tokens:
+        out.append(f"  tokens   : {_fmt_tokens(trace.tokens)}")
+    if trace.cost_usd is not None:
+        out.append(f"  cost     : ${trace.cost_usd:.6f}")
     if trace.request_preview:
         out.append(f"  request  : {_stringify(trace.request_preview, max_io)}")
     if trace.response_preview:
@@ -465,15 +683,17 @@ def render_trace_detail(trace: NTrace, errors_only: bool = False, max_io: int = 
 def render_profile(traces: List[NTrace], top_n: int = 8) -> str:
     out: List[str] = []
     for trace in traces:
-        out.append(f"Trace {trace.trace_id}  total {_fmt_ms(trace.duration_ms)}  [{trace.state}]")
-        for span, self_ms in slowest_spans(trace, top_n):
+        header = f"Trace {trace.trace_id}  total {_fmt_ms(trace.duration_ms)}  [{trace.state}]"
+        if trace.cost_usd is not None:
+            header += f"  ${trace.cost_usd:.6f}"
+        out.append(header)
+        _, children = build_span_forest(trace.spans)
+        for span, self_ms in slowest_spans(trace, top_n, children):
             pct = ""
             if self_ms is not None and trace.duration_ms:
                 pct = f"{(self_ms / trace.duration_ms) * 100:5.1f}%"
-            out.append(
-                f"  {self_ms if self_ms is None else round(self_ms, 1):>8}  "
-                f"{pct:>6}  {span.name}"
-            )
+            # _fmt_ms carries the None case; formatting None directly raises.
+            out.append(f"  {_fmt_ms(self_ms):>9}  {pct:>6}  {span.name}")
         out.append("")
 
     if len(traces) > 1:
@@ -524,35 +744,62 @@ def render_errors(groups: List[Dict[str, Any]]) -> str:
     return "\n".join(out).rstrip()
 
 
+def _render_failing_span(span: NSpan, exc: Optional[Dict[str, str]]) -> List[str]:
+    out = [f"  • {span.name}  [{span.status}]  {_fmt_ms(span.total_ms)}"]
+    if span.status_message:
+        out.append(f"      status: {span.status_message}")
+    if exc:
+        out.append(f"      exception.type   : {exc['type']}")
+        out.append(f"      exception.message: {exc['message']}")
+        if exc["stacktrace"]:
+            tail = exc["stacktrace"].strip().splitlines()[-12:]
+            out.append("      exception.stacktrace (tail):")
+            out.extend("        " + ln for ln in tail)
+    if span.inputs is not None:
+        out.append(f"      inputs : {_stringify(span.inputs, 800)}")
+    if span.outputs is not None:
+        out.append(f"      outputs: {_stringify(span.outputs, 400)}")
+    out.append("")
+    return out
+
+
+def _render_failing_spans(trace: NTrace) -> List[str]:
+    """Full detail for the spans a failure originated in.
+
+    Ancestors that merely re-recorded the same propagating exception are
+    collapsed into a one-line trail instead of repeating the whole stacktrace.
+    """
+    errs = error_spans(trace)
+    if not errs:
+        return ["No error spans. This trace did not fail; review latency below.", ""]
+
+    origins = {span.span_id: exc for span, exc in originating_exceptions(trace)}
+    out = [f"FAILING SPANS ({len(errs)}):"]
+    for span in errs:
+        if origins and span.span_id not in origins:
+            continue
+        out.extend(_render_failing_span(span, origins.get(span.span_id)))
+    propagated = [s.name for s in errs if origins and s.span_id not in origins]
+    if propagated:
+        out.append(f"  propagated through: {', '.join(propagated)}")
+        out.append("")
+    return out
+
+
 def render_diagnose(trace: NTrace) -> str:
     """Structured, compact report meant to be read by the agent to root-cause."""
-    out = [f"DIAGNOSE {trace.trace_id}  [{trace.state}]  total {_fmt_ms(trace.duration_ms)}", ""]
+    head = f"DIAGNOSE {trace.trace_id}  [{trace.state}]  total {_fmt_ms(trace.duration_ms)}"
+    if trace.tokens:
+        head += f"  ({_fmt_tokens(trace.tokens)})"
+    if trace.cost_usd is not None:
+        head += f"  ${trace.cost_usd:.6f}"
+    out = [head, ""]
 
-    errs = error_spans(trace)
-    if errs:
-        out.append(f"FAILING SPANS ({len(errs)}):")
-        for span in errs:
-            out.append(f"  • {span.name}  [{span.status}]  {_fmt_ms(span.total_ms)}")
-            if span.status_message:
-                out.append(f"      status: {span.status_message}")
-            for exc in span_exceptions(span):
-                out.append(f"      exception.type   : {exc['type']}")
-                out.append(f"      exception.message: {exc['message']}")
-                if exc["stacktrace"]:
-                    tail = "\n".join(exc["stacktrace"].strip().splitlines()[-12:])
-                    out.append("      exception.stacktrace (tail):")
-                    out.extend("        " + ln for ln in tail.splitlines())
-            if span.inputs is not None:
-                out.append(f"      inputs : {_stringify(span.inputs, 800)}")
-            if span.outputs is not None:
-                out.append(f"      outputs: {_stringify(span.outputs, 400)}")
-            out.append("")
-    else:
-        out.append("No error spans. This trace did not fail; review latency below.")
-        out.append("")
+    out.extend(_render_failing_spans(trace))
 
     out.append("LATENCY HOTSPOTS (self time):")
-    for span, self_ms in slowest_spans(trace, 5):
+    _, children = build_span_forest(trace.spans)
+    for span, self_ms in slowest_spans(trace, 5, children):
         pct = f"{(self_ms / trace.duration_ms) * 100:.0f}%" if self_ms and trace.duration_ms else "n/a"
         out.append(f"  {_fmt_ms(self_ms):>9}  ({pct:>4})  {span.name}")
     out.append("")
@@ -574,11 +821,14 @@ def _fmt_epoch_ms(ms: Any) -> str:
 # Environment / .env loading and config resolution
 #
 # The backend is chosen entirely from env vars. Alongside the standard MLflow
-# names we accept one local variant: an ARN used directly as the tracking URI.
+# names we accept MLFLOW_TRACKING_ARN. If it's a Secrets Manager ARN
+# (arn:aws:secretsmanager:...), resolve_mlflow_arn_secret() below fetches the
+# secret (JSON with MLFLOW_TRACKING_URI/_USERNAME/_PASSWORD keys, matching
+# this repo's backend/app/llm/load_llm.py) via boto3's default credential
+# chain and populates os.environ. Otherwise it's used verbatim as a fallback
+# tracking URI (kept for backward compatibility / non-AWS setups).
 # --------------------------------------------------------------------------
 
-# Tracking URI: standard name first, then the ARN fallback. An ARN, when
-# present, is used verbatim as the tracking URI (no AWS-specific handling).
 _TRACKING_URI_KEYS = ("MLFLOW_TRACKING_URI", "MLFLOW_TRACKING_ARN")
 _EXPERIMENT_NAME_KEYS = ("MLFLOW_EXPERIMENT_NAME",)
 
@@ -650,6 +900,74 @@ def resolve_tracking_uri(cli_value: Optional[str]) -> Optional[str]:
     return None
 
 
+# Secret JSON keys this repo's backend expects (backend/app/llm/load_llm.py
+# `_load_mlflow_credentials_from_secret`) — the env-var names themselves are
+# used as the JSON keys inside the secret.
+_SECRET_ENV_KEYS = ("MLFLOW_TRACKING_URI", "MLFLOW_TRACKING_USERNAME", "MLFLOW_TRACKING_PASSWORD")
+
+
+def _is_secretsmanager_arn(value: str) -> bool:
+    return value.startswith("arn:aws:secretsmanager:")
+
+
+def _fetch_secretsmanager_json(arn: str) -> Dict[str, Any]:
+    """Fetch and JSON-parse a Secrets Manager secret's SecretString.
+
+    Uses boto3's default credential chain (env vars, profile, SSO, instance
+    role, ...) — whatever AWS credentials are already available in the
+    environment. Region is inferred from the ARN.
+    """
+    try:
+        import boto3
+    except ImportError:
+        sys.exit(
+            "error: MLFLOW_TRACKING_ARN is a Secrets Manager ARN but boto3 is "
+            "not available. Run via `uv run` (boto3 is a declared dependency) "
+            "or `pip install boto3`."
+        )
+    try:
+        client = boto3.Session().client("secretsmanager")
+        resp = client.get_secret_value(SecretId=arn)
+    except Exception as exc:  # noqa: BLE001 - surface a single clean error line
+        sys.exit(
+            f"error: failed to read secret from Secrets Manager ({arn}): "
+            f"{type(exc).__name__}: {exc}\n"
+            "       (check that AWS credentials are configured in the "
+            "environment, e.g. via env vars, `aws sso login`, or --profile)"
+        )
+    try:
+        return json.loads(resp["SecretString"])
+    except (KeyError, json.JSONDecodeError) as exc:
+        sys.exit(f"error: secret {arn!r} did not contain a JSON SecretString: {exc}")
+
+
+def resolve_mlflow_arn_secret() -> None:
+    """If MLFLOW_TRACKING_ARN is a Secrets Manager ARN, resolve it into
+    MLFLOW_TRACKING_URI/_USERNAME/_PASSWORD in ``os.environ``.
+
+    Mirrors backend/app/llm/load_llm.py's `_load_mlflow_credentials_from_secret`:
+    the secret's JSON body is expected to contain the env-var names themselves
+    as keys. No-op if MLFLOW_TRACKING_URI is already set (real env wins), or if
+    MLFLOW_TRACKING_ARN isn't set / isn't a Secrets Manager ARN (e.g. it's
+    already a bare tracking URI — kept for backward compatibility).
+    """
+    if os.environ.get("MLFLOW_TRACKING_URI"):
+        return
+    arn = os.environ.get("MLFLOW_TRACKING_ARN")
+    if not arn or not _is_secretsmanager_arn(arn):
+        return
+    secret = _fetch_secretsmanager_json(arn)
+    missing = [k for k in _SECRET_ENV_KEYS if not secret.get(k)]
+    if missing:
+        sys.exit(
+            f"error: secret {arn!r} is missing required key(s): {', '.join(missing)} "
+            f"(expected {', '.join(_SECRET_ENV_KEYS)})"
+        )
+    for key in _SECRET_ENV_KEYS:
+        os.environ[key] = secret[key]
+    print(f"# mlflow-traces: resolved MLFLOW_TRACKING_ARN via Secrets Manager ({arn})", file=sys.stderr)
+
+
 def env_experiment_name() -> Optional[str]:
     for key in _EXPERIMENT_NAME_KEYS:
         val = os.environ.get(key)
@@ -686,13 +1004,28 @@ def get_client(tracking_uri: Optional[str]):
             "MLFLOW_TRACKING_ARN), pass --tracking-uri, or run where backend/.env "
             "is discoverable (or use --env-file)."
         )
-    os.environ.setdefault("MLFLOW_TRACKING_URI", uri)  # keep fluent API in sync
+    if tracking_uri:  # an explicit flag must beat whatever the env already says
+        os.environ["MLFLOW_TRACKING_URI"] = uri
+    else:
+        os.environ.setdefault("MLFLOW_TRACKING_URI", uri)  # keep fluent API in sync
     return MlflowClient(tracking_uri=uri)
 
 
 def fetch_trace(client, trace_id: str) -> NTrace:
     trace = client.get_trace(trace_id)
     return normalize_trace(trace)
+
+
+def fetch_traces(client, trace_ids: List[str], max_workers: int = 8) -> List[NTrace]:
+    """Fetch several traces concurrently, preserving the requested order.
+
+    Each get_trace is an independent HTTP round trip, so a serial loop makes
+    `get`/`profile` over N ids take N times as long for no reason.
+    """
+    if len(trace_ids) <= 1:
+        return [fetch_trace(client, tid) for tid in trace_ids]
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(trace_ids))) as pool:
+        return list(pool.map(lambda tid: fetch_trace(client, tid), trace_ids))
 
 
 def resolve_experiment_ids(
@@ -722,41 +1055,96 @@ def resolve_experiment_ids(
     return ids
 
 
-def search_error_traces(
-    client, experiment_ids: List[str], extra_filter: Optional[str], max_results: int
-) -> List[NTrace]:
-    filter_string = "trace.status = 'ERROR'"
-    if extra_filter:
-        filter_string = f"{filter_string} AND {extra_filter}"
+def _search_page(client, experiment_ids, filter_string, limit, order_by, page_token):
+    kwargs: Dict[str, Any] = {
+        "experiment_ids": experiment_ids,
+        "filter_string": filter_string,
+        "max_results": limit,
+    }
+    if order_by is not None:
+        kwargs["order_by"] = order_by
+    if page_token:
+        kwargs["page_token"] = page_token
+    return client.search_traces(**kwargs)
 
-    # `experiment_ids` works on 3.13 and 3.14 (deprecated in favour of
-    # `locations` in 3.14); silence that FutureWarning to keep output clean.
-    # order_by is best-effort: retry without it if the field is unsupported.
+
+def search_error_traces(
+    client,
+    experiment_ids: List[str],
+    extra_filter: Optional[str],
+    max_results: int,
+    since_ms: Optional[int] = None,
+) -> List[NTrace]:
+    """Search ERROR traces, following pagination up to ``max_results``.
+
+    The time window is pushed into the server-side filter when possible, so
+    ``--max-results`` bounds traces *inside* the window rather than being spent
+    on newer ones that the caller then discards.
+    """
+    base = ["trace.status = 'ERROR'"]
+    if extra_filter:
+        base.append(extra_filter)
+    windowed = base + [f"trace.timestamp > {since_ms}"] if since_ms is not None else None
+
+    # Both the timestamp predicate and order_by are best-effort: backends differ,
+    # so fall back through progressively plainer queries. `experiment_ids` works
+    # on 3.13 and 3.14 (deprecated for `locations` in 3.14) — silence that
+    # FutureWarning to keep output clean.
+    candidates: List[Tuple[str, Optional[List[str]]]] = []
+    for clauses in ([windowed] if windowed else []) + [base]:
+        for order_by in (["timestamp_ms DESC"], None):
+            candidates.append((" AND ".join(clauses), order_by))
+
     last: Optional[Exception] = None
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning)
-        for order_by in (["timestamp_ms DESC"], None):
+        for filter_string, order_by in candidates:
             try:
-                kwargs: Dict[str, Any] = {
-                    "experiment_ids": experiment_ids,
-                    "filter_string": filter_string,
-                    "max_results": max_results,
-                }
-                if order_by is not None:
-                    kwargs["order_by"] = order_by
-                results = client.search_traces(**kwargs)
-                return [normalize_trace(t) for t in results]
-            except Exception as exc:  # retry without order_by, then surface
+                page = _search_page(
+                    client, experiment_ids, filter_string, max_results, order_by, None
+                )
+            except Exception as exc:  # try the next, plainer, candidate
                 last = exc
+                continue
+
+            # This query shape works; drain further pages (servers cap page size).
+            collected = list(page)
+            token = getattr(page, "token", None)
+            while token and len(collected) < max_results:
+                page = _search_page(
+                    client,
+                    experiment_ids,
+                    filter_string,
+                    max_results - len(collected),
+                    order_by,
+                    token,
+                )
+                if not page:
+                    break
+                collected.extend(page)
+                token = getattr(page, "token", None)
+            return [normalize_trace(t) for t in collected[:max_results]]
     raise last  # type: ignore[misc]
 
 
-def load_trace_from_file(path: str) -> NTrace:
+def load_traces_from_file(path: str) -> List[NTrace]:
+    """Read one or many traces from a JSON dump.
+
+    Accepts a single trace object, a bare list (what ``get --json`` emits for
+    several ids), or ``{"traces": [...]}``.
+    """
     with open(path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
-    if isinstance(data, list):
-        data = data[0]
-    return normalize_trace(data)
+    if isinstance(data, dict) and isinstance(data.get("traces"), list):
+        data = data["traces"]
+    items = data if isinstance(data, list) else [data]
+    if not items:
+        sys.exit(f"error: no traces found in {path}")
+    return [normalize_trace(item) for item in items]
+
+
+def load_trace_from_file(path: str) -> NTrace:
+    return load_traces_from_file(path)[0]
 
 
 def _cutoff_ms(since: Optional[str]) -> Optional[int]:
@@ -784,10 +1172,17 @@ def _cutoff_ms(since: Optional[str]) -> Optional[int]:
 
 
 def _load_traces(args, trace_ids: List[str]) -> List[NTrace]:
+    ids = [tid for tid in (trace_ids or []) if tid]
     if args.from_file:
-        return [load_trace_from_file(args.from_file)]
-    client = get_client(args.tracking_uri)
-    return [fetch_trace(client, tid) for tid in trace_ids]
+        traces = load_traces_from_file(args.from_file)
+        # Ids are optional offline; when given, use them to pick out of a
+        # multi-trace dump (ignored if none of them match, so a placeholder id
+        # still works).
+        matched = [t for t in traces if t.trace_id in set(ids)] if ids else []
+        return matched or traces
+    if not ids:
+        sys.exit("error: no trace id given (pass one or more ids, or use --from-file).")
+    return fetch_traces(get_client(args.tracking_uri), ids)
 
 
 def cmd_get(args) -> int:
@@ -827,7 +1222,7 @@ def cmd_profile(args) -> int:
 
 
 def cmd_diagnose(args) -> int:
-    traces = _load_traces(args, [args.trace_id])
+    traces = _load_traces(args, [args.trace_id] if args.trace_id else [])
     trace = traces[0]
     if args.json:
         payload = trace_to_dict(trace)
@@ -839,16 +1234,24 @@ def cmd_diagnose(args) -> int:
 
 
 def cmd_errors(args) -> int:
+    cutoff = _cutoff_ms(args.since)
     if args.from_file:
-        traces = [load_trace_from_file(args.from_file)]
+        # A dump can hold healthy traces too; the live path filters server-side.
+        traces = [t for t in load_traces_from_file(args.from_file) if is_error_trace(t)]
     else:
         client = get_client(args.tracking_uri)
         exp_ids = resolve_experiment_ids(client, args.experiment_id, args.experiment_name)
-        traces = search_error_traces(client, exp_ids, args.filter, args.max_results)
+        traces = search_error_traces(client, exp_ids, args.filter, args.max_results, cutoff)
 
-    cutoff = _cutoff_ms(args.since)
-    if cutoff is not None:
+    if cutoff is not None:  # also enforce locally: the pushdown is best-effort
         traces = [t for t in traces if (t.request_time_ms or 0) >= cutoff]
+
+    if len(traces) >= args.max_results:
+        print(
+            f"# mlflow-traces: hit --max-results ({args.max_results}); "
+            "counts below are a lower bound.",
+            file=sys.stderr,
+        )
 
     groups = group_errors(traces)
     if args.json:
@@ -895,7 +1298,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_get = sub.add_parser(
         "get", parents=[common], help="Full detail + span-tree waterfall for trace(s)."
     )
-    p_get.add_argument("trace_ids", nargs="+")
+    p_get.add_argument("trace_ids", nargs="*", help="Optional when --from-file is used.")
     p_get.add_argument("--errors-only", action="store_true", help="Show only error spans.")
     p_get.add_argument("--max-io", type=int, default=500, help="Truncate inputs/outputs (chars).")
     p_get.set_defaults(func=cmd_get)
@@ -903,14 +1306,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_prof = sub.add_parser(
         "profile", parents=[common], help="Latency breakdown; aggregate across traces."
     )
-    p_prof.add_argument("trace_ids", nargs="+")
+    p_prof.add_argument("trace_ids", nargs="*", help="Optional when --from-file is used.")
     p_prof.add_argument("--top", type=int, default=8, help="Show N slowest spans per trace.")
     p_prof.set_defaults(func=cmd_profile)
 
     p_diag = sub.add_parser(
         "diagnose", parents=[common], help="Structured root-cause report for one trace."
     )
-    p_diag.add_argument("trace_id")
+    p_diag.add_argument("trace_id", nargs="?", help="Optional when --from-file is used.")
     p_diag.set_defaults(func=cmd_diagnose)
 
     p_err = sub.add_parser(
@@ -926,12 +1329,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _force_utf8_streams() -> None:
+    """Ensure stdout/stderr can encode our Unicode symbols (✓/✗/█) even when
+    the platform's default console encoding can't (e.g. Windows cp1252/437)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="backslashreplace")
+            except Exception:
+                pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    _force_utf8_streams()
     parser = build_parser()
     args = parser.parse_args(argv)
     # A live backend needs config; auto-load a .env unless we're offline or opted out.
     if not args.from_file and not args.no_env_file:
         load_env_file(args.env_file)
+    if not args.from_file:
+        resolve_mlflow_arn_secret()
     try:
         return args.func(args)
     except Exception as exc:  # backend/connection/auth errors → one clean line
