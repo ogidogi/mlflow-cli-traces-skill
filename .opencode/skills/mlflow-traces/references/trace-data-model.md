@@ -26,6 +26,14 @@ A `Trace` object has two parts:
 Useful metadata keys: `mlflow.trace.run_id` (links the trace to an MLflow run),
 `mlflow.source.name`. Useful tag: `mlflow.traceName`.
 
+Metadata values are JSON **strings**, including the aggregates that
+`TraceInfo.token_usage` / `TraceInfo.cost` decode for you:
+
+| Meaning | Metadata key | Decoded shape |
+|---|---|---|
+| Token usage for the trace | `mlflow.trace.tokenUsage` | `{input_tokens, output_tokens, total_tokens}` |
+| Cost for the trace (USD) | `mlflow.trace.cost` | `{input_cost, output_cost, total_cost}` |
+
 ## Span (OpenTelemetry-compliant)
 
 Each `Span` in `trace.data.spans`:
@@ -44,6 +52,36 @@ Each `Span` in `trace.data.spans`:
 **Per-span duration:** `(end_time_ns - start_time_ns) / 1_000_000` ms.
 **Self time:** span total minus the sum of its direct children's totals.
 
+LLM span attributes (present only when the provider integration reports them;
+`Span.span_type` / `.model_name` / `.llm_cost` are the typed accessors):
+
+| Meaning | Attribute key |
+|---|---|
+| Span type | `mlflow.spanType` |
+| Model / provider | `mlflow.llm.model` / `mlflow.llm.provider` |
+| Token usage | `mlflow.chat.tokenUsage` — `{input_tokens, output_tokens, total_tokens, cache_read_input_tokens, cache_creation_input_tokens}` |
+| Cost (USD) | `mlflow.llm.cost` — `{input_cost, output_cost, total_cost}` |
+
+## JSON export shape (`Trace.to_json()`)
+
+A serialized trace is **not** the live entity's field names — it is the OTel
+proto spelling. This is what a dump saved from the UI or from
+`trace.to_json()` looks like, and what `--from-file` has to read:
+
+| Live entity | JSON export |
+|---|---|
+| `info.execution_duration` (int ms) | `info.execution_duration_ms` |
+| `info.request_time` (int epoch ms) | `info.request_time` (**ISO-8601 string**) |
+| `span.parent_id` | `span.parent_span_id` |
+| `span.start_time_ns` / `end_time_ns` | `span.start_time_unix_nano` / `end_time_unix_nano` |
+| `span.status.status_code` = `ERROR` | `span.status.code` = `"STATUS_CODE_ERROR"`, `.message` |
+| `event.timestamp` | `event.time_unix_nano` |
+| `span.inputs` / `span.outputs` | *absent* — read `attributes["mlflow.spanInputs"/"mlflow.spanOutputs"]` |
+| `span.attributes` values (decoded) | every value is a **JSON-encoded string** |
+
+Span/trace ids inside the export are base64 OTel ids, not the `tr-<hex>` form;
+they are still internally consistent, so parent links resolve.
+
 ## Exceptions (root-causing)
 
 When an exception propagates out of a traced span, MLflow sets
@@ -54,9 +92,11 @@ When an exception propagates out of a traced span, MLflow sets
 - `exception.message`
 - `exception.stacktrace`
 
-A parent span's ERROR is often *propagated* from a failing child — the child
-with the `exception` event is the real culprit. The CLI's `errors` command
-groups by the exception-bearing span for exactly this reason.
+An exception that propagates is re-recorded on **every** ancestor span, not
+just the one that raised — a 3-level trace yields the same `exception` event
+three times, with `status.description` set to `"Type: message"` on each. The
+CLI attributes it to the *deepest* span carrying it (the origin) and reports
+the ancestors as a propagation trail, so one failure is counted once.
 
 ## Fetch & search (Python)
 
@@ -72,10 +112,17 @@ errors = client.search_traces(                # many, filtered
     order_by=["timestamp_ms DESC"],
     max_results=200,
 )
+errors.token                                  # page token; None when exhausted
 ```
 
+`search_traces` returns a `PagedList`: the server may cap the page below
+`max_results`, so follow `.token` via `page_token=` to collect the rest.
+`include_spans=True` (the default) is what makes span-level grouping possible.
+
 `filter_string` is a SQL-like DSL over status, tags, and metadata, e.g.
-`trace.status = 'ERROR' AND tag.environment = 'prod'`.
+`trace.status = 'ERROR' AND tag.environment = 'prod'`. A time window pushes
+down as `trace.timestamp > <epoch_ms>`, which beats filtering client-side —
+otherwise `max_results` is spent on traces outside the window.
 
 > Note: in MLflow 3.14 the `experiment_ids` argument is deprecated in favour of
 > `locations`, but it still works (the CLI silences that warning). It remains

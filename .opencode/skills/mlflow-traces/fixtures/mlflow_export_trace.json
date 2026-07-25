@@ -1,0 +1,114 @@
+{
+  "info": {
+    "trace_id": "tr-2ffbd15e186e27b6f8b05b6dc49d4372",
+    "trace_location": {
+      "type": "MLFLOW_EXPERIMENT",
+      "mlflow_experiment": {
+        "experiment_id": "0"
+      }
+    },
+    "request_time": "2026-07-25T02:00:38.226Z",
+    "state": "ERROR",
+    "trace_metadata": {
+      "mlflow.traceInputs": "{\"p\": \"x\"}",
+      "mlflow.trace.tokenUsage": "{\"input_tokens\": 120, \"output_tokens\": 30, \"total_tokens\": 150}",
+      "mlflow.trace.cost": "{\"input_cost\": 0.001, \"output_cost\": 0.002, \"total_cost\": 0.003}"
+    },
+    "tags": {
+      "mlflow.traceName": "root"
+    },
+    "request_preview": "{\"p\": \"x\"}",
+    "execution_duration_ms": 107
+  },
+  "data": {
+    "spans": [
+      {
+        "trace_id": "L/vRXhhuJ7b4sFttxJ1Dcg==",
+        "span_id": "Hnc50EsS3ro=",
+        "parent_span_id": null,
+        "name": "root",
+        "start_time_unix_nano": 1784944838226996000,
+        "end_time_unix_nano": 1784944838334971000,
+        "events": [
+          {
+            "name": "exception",
+            "time_unix_nano": 1784944838334934016,
+            "attributes": {
+              "exception.message": "bad x",
+              "exception.type": "ValueError",
+              "exception.stacktrace": "Traceback (most recent call last):\n  File \"app/rag.py\", line 42, in llm\n    raise ValueError(\"bad x\")\nValueError: bad x"
+            }
+          }
+        ],
+        "status": {
+          "code": "STATUS_CODE_ERROR",
+          "message": "ValueError: bad x"
+        },
+        "attributes": {
+          "mlflow.traceRequestId": "\"tr-2ffbd15e186e27b6f8b05b6dc49d4372\"",
+          "mlflow.spanType": "\"UNKNOWN\"",
+          "mlflow.spanFunctionName": "\"root\"",
+          "mlflow.spanInputs": "{\"p\": \"x\"}",
+          "mlflow.spanLogLevel": "40"
+        },
+        "links": []
+      },
+      {
+        "trace_id": "L/vRXhhuJ7b4sFttxJ1Dcg==",
+        "span_id": "uyHow/OemYI=",
+        "parent_span_id": "Hnc50EsS3ro=",
+        "name": "retrieve",
+        "start_time_unix_nano": 1784944838245776000,
+        "end_time_unix_nano": 1784944838270969000,
+        "events": [],
+        "status": {
+          "code": "STATUS_CODE_OK",
+          "message": ""
+        },
+        "attributes": {
+          "mlflow.traceRequestId": "\"tr-2ffbd15e186e27b6f8b05b6dc49d4372\"",
+          "mlflow.spanType": "\"UNKNOWN\"",
+          "mlflow.spanFunctionName": "\"retrieve\"",
+          "mlflow.spanInputs": "{\"p\": \"x\"}",
+          "mlflow.spanOutputs": "[\"doc\"]",
+          "mlflow.spanLogLevel": "10"
+        },
+        "links": []
+      },
+      {
+        "trace_id": "L/vRXhhuJ7b4sFttxJ1Dcg==",
+        "span_id": "qHbpxVanz1c=",
+        "parent_span_id": "Hnc50EsS3ro=",
+        "name": "llm",
+        "start_time_unix_nano": 1784944838279141000,
+        "end_time_unix_nano": 1784944838332097000,
+        "events": [
+          {
+            "name": "exception",
+            "time_unix_nano": 1784944838332033024,
+            "attributes": {
+              "exception.message": "bad x",
+              "exception.type": "ValueError",
+              "exception.stacktrace": "Traceback (most recent call last):\n  File \"app/rag.py\", line 42, in llm\n    raise ValueError(\"bad x\")\nValueError: bad x"
+            }
+          }
+        ],
+        "status": {
+          "code": "STATUS_CODE_ERROR",
+          "message": "ValueError: bad x"
+        },
+        "attributes": {
+          "mlflow.traceRequestId": "\"tr-2ffbd15e186e27b6f8b05b6dc49d4372\"",
+          "mlflow.spanType": "\"LLM\"",
+          "mlflow.spanFunctionName": "\"llm\"",
+          "mlflow.spanInputs": "{\"p\": \"x\"}",
+          "mlflow.spanLogLevel": "40",
+          "mlflow.llm.model": "\"gpt-4o-mini\"",
+          "mlflow.chat.tokenUsage": "{\"input_tokens\": 120, \"output_tokens\": 30, \"total_tokens\": 150}",
+          "mlflow.llm.cost": "{\"input_cost\": 0.001, \"output_cost\": 0.002, \"total_cost\": 0.003}"
+        },
+        "links": []
+      }
+    ]
+  }
+}
